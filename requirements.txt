@@ -18,3 +18,4 @@ beautifulsoup4
 structlog
 python-dotenv
 networkx
+python-dateutil

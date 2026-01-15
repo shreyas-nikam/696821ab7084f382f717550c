@@ -60,10 +60,12 @@ session_manager = SessionStateManager()
 
 # Schedule the async document loading if not already done
 if not st.session_state.fomc_documents_initialized:
-    st.info("Loading initial FOMC documents (this may take a moment)...")
+    st.info("Loading FOMC documents (this may take a moment)...")
     try:
         # Run the async function synchronously using asyncio.run()
-        st.session_state.current_fomc_documents = asyncio.run(main_ingestion())
+        # Fetch ALL documents and cache them for preview
+        st.session_state.current_fomc_documents = asyncio.run(
+            main_ingestion(recent_only=False))
         st.session_state.fomc_documents_initialized = True
         st.rerun()  # Rerun to display the loaded documents
     except Exception as e:
@@ -153,8 +155,13 @@ def render_new_analysis():
     current_request_id = st.session_state.current_request_id
 
     st.markdown(f"### Select FOMC Meeting")
-    available_meetings = get_fomc_meeting_dates(
-        start=date(2020, 1, 1), end=date.today())
+
+    # Get available meetings from actually loaded documents
+    if st.session_state.current_fomc_documents:
+        available_meetings = sorted(list(set(
+            [doc.meeting_date for doc in st.session_state.current_fomc_documents])), reverse=True)
+    else:
+        available_meetings = []
 
     col1, col2 = st.columns([2, 1])
     with col1:
@@ -176,6 +183,62 @@ def render_new_analysis():
                 st.markdown(f"{icon} {doc_type.replace('_', ' ').title()}")
         else:
             st.info("No meeting dates available or selected.")
+
+    # Document Preview Section
+    if selected_meeting:
+        st.markdown(f"### Document Preview")
+
+        # Debug: Show total documents loaded
+        total_docs = len(st.session_state.current_fomc_documents)
+        if total_docs == 0:
+            st.warning(
+                "No documents loaded yet. Please wait for initial loading to complete.")
+        else:
+            # Debug: Show what dates are available and being compared
+            available_dates = set(
+                [doc.meeting_date for doc in st.session_state.current_fomc_documents])
+
+            # Find documents for the selected meeting
+            selected_docs = [doc for doc in st.session_state.current_fomc_documents
+                             if doc.meeting_date == selected_meeting]
+
+            if selected_docs:
+                tab_statement, tab_minutes = st.tabs(
+                    ["Statement Preview", "Minutes Preview"])
+
+                with tab_statement:
+                    statement_doc = next(
+                        (doc for doc in selected_docs if doc.document_type == FOMCDocumentType.STATEMENT), None)
+                    if statement_doc and statement_doc.raw_text:
+                        # Show first 1000 characters as preview
+                        preview_text = statement_doc.raw_text[:1000]
+                        word_count = len(statement_doc.raw_text.split())
+                        st.markdown(f"**Total words:** {word_count}")
+                        with st.expander("Show Statement Preview", expanded=True):
+                            st.markdown(f"{preview_text}..." if len(
+                                statement_doc.raw_text) > 1000 else preview_text)
+                    else:
+                        st.info(
+                            "Statement document not available for this meeting.")
+
+                with tab_minutes:
+                    minutes_doc = next(
+                        (doc for doc in selected_docs if doc.document_type == FOMCDocumentType.MINUTES), None)
+                    if minutes_doc and minutes_doc.raw_text:
+                        # Show first 1000 characters as preview
+                        preview_text = minutes_doc.raw_text[:1000]
+                        word_count = len(minutes_doc.raw_text.split())
+                        st.markdown(f"**Total words:** {word_count}")
+                        with st.expander("Show Minutes Preview", expanded=True):
+                            st.markdown(f"{preview_text}..." if len(
+                                minutes_doc.raw_text) > 1000 else preview_text)
+                    else:
+                        st.info(
+                            "Minutes document not available for this meeting.")
+            else:
+                st.info(
+                    f"No documents found for {selected_meeting.strftime('%B %d, %Y')}. Total loaded: {total_docs} documents.")
+
     st.divider()
 
     st.markdown(f"### Analysis Options")
@@ -223,72 +286,100 @@ def render_new_analysis():
         log_container = st.container()
 
         async def run_analysis_workflow():
-            workflow = create_fomc_workflow()
-            initial_state = AgentState(
-                meeting_date=selected_meeting,
-                request_id=request_id,
-                requested_at=datetime.now(),
-                config={
-                    "include_historical_context": include_historical_context,
-                    "num_themes_to_extract": num_themes_to_extract,
-                    "auto_validate_citations": auto_validate_citations,
-                    "minimum_confidence_threshold": minimum_confidence_threshold,
-                }
-            )
-
-            step_count = 0
-            total_steps = 10
-            final_state = None
-            logged_nodes = set()  # Track which nodes we've already logged
-
             try:
-                # Use astream_events for more granular control and status updates
-                async for event in workflow.astream_events(initial_state, {"configurable": {"thread_id": request_id}}, version="v1"):
-                    event_type = event["event"]
-                    current_node = None  # Initialize current_node for each event
-                    is_start_event = False
+                st.write("🔍 Step 1: Creating workflow...")
+                workflow = create_fomc_workflow()
+                st.write("✅ Workflow created successfully")
 
-                    if event_type == "on_chain_start":
-                        # This is usually the chain name
-                        current_node = event["name"]
-                        is_start_event = True
-                    elif event_type == "on_tool_start":
-                        current_node = event["name"]  # Tool name
-                        is_start_event = True
-                    elif event_type == "on_agent_action":
-                        current_node = event["name"]  # Agent action
-                        is_start_event = True
-                    elif event_type == "on_chain_end":
-                        # This is usually the chain name
-                        current_node = event["name"]
+                st.write("🔍 Step 2: Creating initial state...")
+                initial_state = AgentState(
+                    meeting_date=selected_meeting,
+                    request_id=request_id,
+                    requested_at=datetime.now(),
+                    config={
+                        "include_historical_context": include_historical_context,
+                        "num_themes_to_extract": num_themes_to_extract,
+                        "auto_validate_citations": auto_validate_citations,
+                        "minimum_confidence_threshold": minimum_confidence_threshold,
+                    }
+                )
+                st.write(f"✅ Initial state created: {initial_state}")
+
+                step_count = 0
+                total_steps = 10
+                final_state = None
+                logged_nodes = set()  # Track which nodes we've already logged
+
+                st.write("🔍 Step 3: Starting workflow stream...")
+                try:
+                    # Use astream_events for more granular control and status updates
+                    async for event in workflow.astream_events(initial_state, {"configurable": {"thread_id": request_id}}, version="v1"):
+                        event_type = event["event"]
+                        current_node = None  # Initialize current_node for each event
                         is_start_event = False
 
-                    # Update progress and status only for start events to avoid duplicates
-                    if current_node and is_start_event and current_node not in logged_nodes:
-                        logged_nodes.add(current_node)
-                        step_count += 1
-                        progress = min(step_count / total_steps, 0.95)
-                        progress_bar.progress(
-                            progress, text=f"Running: **{current_node.replace('_', ' ').title()}**")
-                        status_text.markdown(f"Current Step: `{current_node}`")
-                        with log_container:
-                            st.markdown(f"✓ Started: `{current_node}`")
+                        if event_type == "on_chain_start":
+                            # This is usually the chain name
+                            current_node = event["name"]
+                            is_start_event = True
+                        elif event_type == "on_tool_start":
+                            current_node = event["name"]  # Tool name
+                            is_start_event = True
+                        elif event_type == "on_agent_action":
+                            current_node = event["name"]  # Agent action
+                            is_start_event = True
+                        elif event_type == "on_chain_end":
+                            # This is usually the chain name
+                            current_node = event["name"]
+                            is_start_event = False
 
-                        # Store detailed events and audit entries in session_manager
-                        audit_entry = event.get("audit_entry")
-                        session_manager.update_step(
-                            request_id, current_node, progress, audit_entry)
+                        # Update progress and status only for start events to avoid duplicates
+                        if current_node and is_start_event and current_node not in logged_nodes:
+                            logged_nodes.add(current_node)
+                            step_count += 1
+                            progress = min(step_count / total_steps, 0.95)
+                            progress_bar.progress(
+                                progress, text=f"Running: **{current_node.replace('_', ' ').title()}**")
+                            status_text.markdown(
+                                f"Current Step: `{current_node}`")
+                            with log_container:
+                                st.markdown(f"✓ Started: `{current_node}`")
 
-                    # Assuming 'workflow' is the top-level chain name
-                    if event_type == "on_chain_end" and event["name"] == "workflow":
-                        # Extract final state from workflow output
-                        final_state = event["data"]["output"]["output"]
+                            st.write(
+                                f"📊 Processing node: {current_node}, Progress: {progress:.2%}")
+
+                            # Store detailed events in session_manager
+                            try:
+                                session_manager.update_step(
+                                    request_id, current_node, progress, None)
+                            except Exception as e:
+                                st.write(
+                                    f"⚠️ Warning: Failed to update session manager: {e}")
+
+                        # Assuming 'workflow' is the top-level chain name
+                        if event_type == "on_chain_end" and event["name"] == "workflow":
+                            st.write(
+                                "🔍 Step 4: Workflow chain ended, extracting final state...")
+                            # Extract final state from workflow output
+                            final_state = event["data"]["output"]["output"]
+                            st.write(
+                                f"✅ Final state extracted: {type(final_state)}")
+
+                    st.write("✅ Workflow stream completed")
+                except Exception as stream_error:
+                    st.error(
+                        f"❌ Error during workflow streaming: {stream_error}")
+                    st.write(
+                        f"Full error details: {type(stream_error).__name__}: {str(stream_error)}")
+                    raise
 
                 progress_bar.progress(1.0, text="Analysis Complete!")
                 status_text.success("Workflow finished successfully!")
 
+                st.write("🔍 Step 5: Processing final state...")
                 # Update request history and latest memo data
                 if final_state and final_state.get("draft_memo"):
+                    st.write("✅ Draft memo found in final state")
                     st.session_state.latest_memo_data = FOMCMemo(
                         **final_state["draft_memo"])
 
@@ -314,9 +405,17 @@ def render_new_analysis():
                     else:
                         st.warning(
                             "Analysis complete with warnings/errors. Review required.")
+                else:
+                    st.error("❌ No draft memo found in final state")
+                    st.write(
+                        f"Final state keys: {final_state.keys() if final_state else 'None'}")
 
             except Exception as e:
                 st.error(f"Analysis workflow failed: {e}")
+                st.write(f"❌ Error type: {type(e).__name__}")
+                st.write(f"❌ Error details: {str(e)}")
+                import traceback
+                st.write(f"❌ Full traceback:\n{traceback.format_exc()}")
                 status_text.error("Workflow failed!")
                 progress_bar.progress(0.0, text="Failed!")
                 # Mark the request in history as failed if it was created

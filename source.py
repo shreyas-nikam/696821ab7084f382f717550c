@@ -32,6 +32,7 @@ Alex begins by configuring his Python environment, installing the necessary libr
 We'll install `openai` for LLM interaction, `langchain` for core components (though we'll use direct API calls for most LLM interactions for explicit control), `langgraph` for conceptual workflow state management (though explicit function calls will demonstrate the flow), `chromadb` for our vector store, `pydantic` for data modeling, `httpx` and `beautifulsoup4` for web scraping, and `structlog` for structured logging.
 """
 
+from openai import AsyncOpenAI
 from typing import TypedDict
 import networkx as nx
 import plotly.graph_objects as go
@@ -51,6 +52,7 @@ import hashlib
 import httpx
 import json
 import os
+from pathlib import Path
 
 
 """### 1.2. Import Dependencies and Configure API Key
@@ -91,7 +93,11 @@ structlog.configure(
 logger = structlog.get_logger()
 
 # Global LLM client (Changed to AsyncOpenAI for async calls)
-llm_client = None
+llm_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY", ""))
+
+# Cache directory for FOMC HTML files
+CACHE_DIR = Path("fomc_cache")
+CACHE_DIR.mkdir(exist_ok=True)
 
 """### 1.3. Define Pydantic Data Models and Utility Functions
 
@@ -277,6 +283,89 @@ class AuditEntry(BaseModel):
     agent: str
     action: str
     inputs: Dict[str, Any]
+    outputs: Optional[Dict[str, Any]] = None
+    duration_ms: Optional[float] = None
+
+# --- Response Models for Structured LLM Outputs ---
+
+
+class ThemeCitation(BaseModel):
+    """Citation within a theme."""
+    citation_id: str
+    document_id: str
+    section_id: str
+    paragraph_number: int
+    quote: str
+    quote_start: int
+    quote_end: int
+
+
+class ThemeData(BaseModel):
+    """Individual theme data from LLM."""
+    theme_name: str
+    description: str
+    keywords: List[str]
+    citations: List[ThemeCitation]
+    confidence: float
+
+
+class ThemesResponse(BaseModel):
+    """Response model for theme extraction."""
+    themes: List[ThemeData]
+
+
+class ToneComponentsData(BaseModel):
+    """Tone components data from LLM."""
+    inflation_stance: float
+    employment_stance: float
+    growth_outlook: float
+    policy_bias: float
+    uncertainty_level: float
+
+
+class ToneAnalysisResponse(BaseModel):
+    """Response model for tone analysis."""
+    overall_score: float
+    confidence: float
+    components: ToneComponentsData
+    citations: List[ThemeCitation]
+    explanation: str
+
+
+class SurpriseData(BaseModel):
+    """Individual surprise data from LLM."""
+    surprise_id: str
+    category: Literal[
+        "policy_change",
+        "language_shift",
+        "forecast_revision",
+        "dissent",
+        "new_concern",
+        "omission"
+    ]
+    description: str
+    market_relevance: Literal["low", "medium", "high"]
+    citations: List[ThemeCitation]
+    confidence: float
+
+
+class SurprisesResponse(BaseModel):
+    """Response model for surprise detection."""
+    surprises: List[SurpriseData]
+
+
+class HallucinationCheckResponse(BaseModel):
+    """Response model for hallucination check."""
+    supported: bool
+    confidence: float
+    supporting_evidence: str
+    reason: str
+
+
+class MemoGenerationResponse(BaseModel):
+    """Response model for memo generation."""
+    executive_summary: str
+    market_implications: str
     outputs: Dict[str, Any]
     duration_ms: int
     reviewer_id: Optional[str] = None  # For human decisions
@@ -704,13 +793,336 @@ logger.info("Initiating document ingestion for FOMC meeting",
             meeting_date=fomc_date)
 
 
-async def main_ingestion():
-    # Simulate fetching documents
-    fomc_statement = await fetch_fomc_statement(fomc_date)
-    # Note: In real life, minutes are later. For demo, we assume they are available.
-    fomc_minutes = await fetch_fomc_minutes(fomc_date)
-    fomc_press_conference = await fetch_press_conference(fomc_date)
-    return [fomc_statement, fomc_minutes, fomc_press_conference]
+def get_cache_path(doc_type: str, meeting_date: date) -> Path:
+    """Get the cache file path for a document."""
+    date_str = meeting_date.strftime("%Y%m%d")
+    return CACHE_DIR / f"{doc_type}_{date_str}.html"
+
+def load_from_cache(doc_type: str, meeting_date: date) -> Optional[str]:
+    """Load HTML content from cache if it exists."""
+    cache_path = get_cache_path(doc_type, meeting_date)
+    if cache_path.exists():
+        try:
+            return cache_path.read_text(encoding='utf-8')
+        except Exception as e:
+            print(f"Error reading cache file {cache_path}: {e}")
+            return None
+    return None
+
+def save_to_cache(doc_type: str, meeting_date: date, html_content: str) -> None:
+    """Save HTML content to cache."""
+    cache_path = get_cache_path(doc_type, meeting_date)
+    try:
+        cache_path.write_text(html_content, encoding='utf-8')
+        print(f"Cached {doc_type} for {meeting_date} to {cache_path}")
+    except Exception as e:
+        print(f"Error saving to cache {cache_path}: {e}")
+
+async def fetch_fomc_statement_from_url(url: str, meeting_date: date) -> Optional[FOMCDocument]:
+    """
+    Fetches and parses an FOMC statement from the provided URL.
+    Checks cache first before fetching from URL.
+    """
+    try:
+        # Check cache first
+        html_content = load_from_cache("statement", meeting_date)
+        
+        if html_content is None:
+            # Fetch from URL if not in cache
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                html_content = response.text
+                # Save to cache
+                save_to_cache("statement", meeting_date, html_content)
+        else:
+            print(f"Loaded statement for {meeting_date} from cache")
+
+        # Parse the HTML content
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_content, 'html.parser')
+
+        # Extract text from the main content area
+        # FOMC statements are typically in specific divs
+        text_content = ""
+
+        # Try to find the main content
+        content_div = soup.find('div', {'id': 'article'}) or soup.find(
+            'div', {'class': 'col-xs-12'})
+        if content_div:
+            # Remove script and style elements
+            for script in content_div(["script", "style"]):
+                script.decompose()
+            text_content = content_div.get_text(separator='\n', strip=True)
+        else:
+            # Fallback: get all paragraph text
+            paragraphs = soup.find_all('p')
+            text_content = '\n\n'.join(
+                [p.get_text(strip=True) for p in paragraphs])
+
+        if not text_content:
+            logger.warning(f"No content extracted from {url}")
+            return None
+
+        sections = [
+            DocumentSection(
+                section_id="main",
+                heading="FOMC Statement",
+                text=text_content,
+                start_position=0,
+                end_position=len(text_content),
+                speaker=None,
+                paragraph_numbers=list(
+                    range(1, count_paragraphs(text_content) + 1))
+            )
+        ]
+
+        doc_id = f"statement_{meeting_date.isoformat()}"
+        return FOMCDocument(
+            document_id=doc_id,
+            document_type=FOMCDocumentType.STATEMENT,
+            meeting_date=meeting_date,
+            publication_date=meeting_date,
+            title=f"FOMC Statement - {meeting_date.strftime('%B %d, %Y')}",
+            source_url=url,
+            raw_text=text_content,
+            sections=sections,
+            metadata=DocumentMetadata(
+                ingestion_timestamp=datetime.now(),
+                source_hash=hashlib.sha256(text_content.encode()).hexdigest(),
+                parser_version="1.0.0",
+                word_count=len(text_content.split()),
+            )
+        )
+    except Exception as e:
+        logger.error(f"Error fetching statement from {url}", error=str(e))
+        return None
+
+
+async def fetch_fomc_minutes_from_url(url: str, meeting_date: date) -> Optional[FOMCDocument]:
+    """
+    Fetches and parses FOMC minutes from the provided URL.
+    Checks cache first before fetching from URL.
+    """
+    try:
+        # Check cache first
+        html_content = load_from_cache("minutes", meeting_date)
+        
+        if html_content is None:
+            # Fetch from URL if not in cache
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.get(url)
+                response.raise_for_status()
+                html_content = response.text
+                # Save to cache
+                save_to_cache("minutes", meeting_date, html_content)
+        else:
+            print(f"Loaded minutes for {meeting_date} from cache")
+
+        # Parse the HTML content
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html_content, 'html.parser')
+
+        # Extract text from the main content area
+        text_content = ""
+
+        # Try to find the main content
+        content_div = soup.find('div', {'id': 'article'}) or soup.find(
+            'div', {'class': 'col-xs-12'})
+        if content_div:
+            # Remove script and style elements
+            for script in content_div(["script", "style"]):
+                script.decompose()
+            text_content = content_div.get_text(separator='\n', strip=True)
+        else:
+            # Fallback: get all paragraph text
+            paragraphs = soup.find_all('p')
+            text_content = '\n\n'.join(
+                [p.get_text(strip=True) for p in paragraphs])
+
+        if not text_content:
+            logger.warning(f"No content extracted from {url}")
+            return None
+
+        # Try to extract sections from minutes (simplified)
+        sections = []
+
+        # Look for section headers in the HTML
+        headers = soup.find_all(['h2', 'h3', 'h4'])
+        if headers:
+            current_position = 0
+            for i, header in enumerate(headers):
+                heading_text = header.get_text(strip=True)
+                # Get text until next header
+                section_text = ""
+                for sibling in header.find_all_next():
+                    if sibling.name in ['h2', 'h3', 'h4']:
+                        break
+                    if sibling.name == 'p':
+                        section_text += sibling.get_text(strip=True) + "\n\n"
+
+                if section_text:
+                    sections.append(DocumentSection(
+                        section_id=f"section_{i}",
+                        heading=heading_text,
+                        text=section_text.strip(),
+                        start_position=current_position,
+                        end_position=current_position + len(section_text),
+                        paragraph_numbers=list(
+                            range(1, count_paragraphs(section_text) + 1))
+                    ))
+                    current_position += len(section_text)
+
+        # If no sections found, create one main section
+        if not sections:
+            sections = [
+                DocumentSection(
+                    section_id="main",
+                    heading="FOMC Minutes",
+                    text=text_content,
+                    start_position=0,
+                    end_position=len(text_content),
+                    speaker=None,
+                    paragraph_numbers=list(
+                        range(1, count_paragraphs(text_content) + 1))
+                )
+            ]
+
+        doc_id = f"minutes_{meeting_date.isoformat()}"
+        # Minutes are typically released 3 weeks after meeting
+        publication_date = meeting_date + timedelta(weeks=3)
+
+        return FOMCDocument(
+            document_id=doc_id,
+            document_type=FOMCDocumentType.MINUTES,
+            meeting_date=meeting_date,
+            publication_date=publication_date,
+            title=f"FOMC Minutes - {meeting_date.strftime('%B %d, %Y')}",
+            source_url=url,
+            raw_text=text_content,
+            sections=sections,
+            metadata=DocumentMetadata(
+                ingestion_timestamp=datetime.now(),
+                source_hash=hashlib.sha256(text_content.encode()).hexdigest(),
+                parser_version="1.0.0",
+                word_count=len(text_content.split()),
+            )
+        )
+    except Exception as e:
+        logger.error(f"Error fetching minutes from {url}", error=str(e))
+        return None
+
+
+async def main_ingestion(limit: Optional[int] = None, recent_only: bool = False):
+    """
+    Reads FOMC data from CSV and fetches all available documents.
+
+    Args:
+        limit: Maximum number of documents to fetch (None for all)
+        recent_only: If True, only fetch documents from 2024 onwards
+
+    Returns:
+        List of FOMCDocument objects
+    """
+    import csv
+    import os
+    from dateutil import parser as date_parser
+
+    documents = []
+    csv_path = os.path.join(os.path.dirname(__file__), "fomc_data.csv")
+
+    try:
+        with open(csv_path, 'r', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            rows = list(reader)
+
+            # Filter rows if recent_only is True
+            if recent_only:
+                rows = [r for r in rows if int(r['Year']) >= 2024]
+
+            logger.info(f"Processing {len(rows)} FOMC meetings from CSV")
+
+            for idx, row in enumerate(rows, 1):
+                if limit and len(documents) >= limit:
+                    logger.info(f"Reached document limit of {limit}")
+                    break
+                year = row['Year']
+                date_str = row['Date']
+                statement_url = row['Statement HTML Link']
+                minutes_url = row['Minutes HTML Link']
+
+                # Parse the date
+                try:
+                    # Handle various date formats
+                    if '/' in date_str:
+                        # Handle ranges like "Jan/Feb 31-1"
+                        parts = date_str.split()
+                        if len(parts) >= 2:
+                            # Get second month for ranges
+                            month_part = parts[0].split('/')[-1]
+                            day_part = parts[1].split('-')[0]  # Get first day
+                            meeting_date = date_parser.parse(
+                                f"{month_part} {day_part}, {year}").date()
+                        else:
+                            meeting_date = date_parser.parse(
+                                f"{date_str}, {year}").date()
+                    else:
+                        # Standard format like "Jan 28-29"
+                        parts = date_str.split()
+                        if len(parts) >= 2 and '-' in parts[1]:
+                            # Get first day of range
+                            day = parts[1].split('-')[0]
+                            meeting_date = date_parser.parse(
+                                f"{parts[0]} {day}, {year}").date()
+                        else:
+                            meeting_date = date_parser.parse(
+                                f"{date_str}, {year}").date()
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to parse date: {date_str}, {year}", error=str(e))
+                    continue
+
+                logger.info(
+                    f"Processing meeting {idx}/{len(rows)}: {year} {date_str}")
+
+                # Fetch statement if URL is valid
+                if statement_url and statement_url != 'N/A':
+                    try:
+                        statement_doc = await fetch_fomc_statement_from_url(statement_url, meeting_date)
+                        if statement_doc:
+                            documents.append(statement_doc)
+                            logger.info(
+                                f"✓ Fetched statement for {meeting_date} ({statement_doc.metadata.word_count} words)")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to fetch statement for {meeting_date}", error=str(e))
+
+                # Fetch minutes if URL is valid
+                if minutes_url and minutes_url != 'N/A':
+                    if limit and len(documents) >= limit:
+                        break
+                    try:
+                        minutes_doc = await fetch_fomc_minutes_from_url(minutes_url, meeting_date)
+                        if minutes_doc:
+                            documents.append(minutes_doc)
+                            logger.info(
+                                f"✓ Fetched minutes for {meeting_date} ({minutes_doc.metadata.word_count} words)")
+                    except Exception as e:
+                        logger.error(
+                            f"Failed to fetch minutes for {meeting_date}", error=str(e))
+
+        logger.info(
+            f"Successfully ingested {len(documents)} documents from CSV")
+        return documents
+
+    except Exception as e:
+        logger.error(f"Failed to read CSV or ingest documents", error=str(e))
+        # Return fallback mock data
+        logger.info("Falling back to mock data")
+        fomc_statement = await fetch_fomc_statement(fomc_date)
+        fomc_minutes = await fetch_fomc_minutes(fomc_date)
+        fomc_press_conference = await fetch_press_conference(fomc_date)
+        return [fomc_statement, fomc_minutes, fomc_press_conference]
 
 # current_fomc_documents = await main_ingestion()
 
@@ -1010,6 +1422,7 @@ Example:
 """
 
 
+# Pydantic models for structured output
 async def extract_themes(
     documents: List[FOMCDocument],
     n_themes: int = 5
@@ -1022,22 +1435,24 @@ async def extract_themes(
         for doc in documents
     ])
 
-    response = await llm_client.chat.completions.create(
-        model="gpt-4-turbo",
+    response = await llm_client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
         messages=[
             {"role": "system", "content": THEME_EXTRACTION_PROMPT},
             {"role": "user", "content": combined_text}
         ],
-        response_format={"type": "json_object"},
-        temperature=0.3  # Moderate temperature for balanced creativity and consistency
+        response_format=ThemesResponse,
+        temperature=0.3
     )
 
-    raw_themes_output = json.loads(response.choices[0].message.content)
+    raw_themes_output = response.choices[0].message.parsed
 
     themes = []
-    for theme_data in raw_themes_output.get("themes", [])[:n_themes]:
+    for theme_data in raw_themes_output.themes[:n_themes]:
         validated_citations = []
-        for cite_dict in theme_data.get("citations", []):
+        for cite in theme_data.citations:
+            # Convert to dict for processing
+            cite_dict = cite.model_dump()
             # Need to get actual start/end positions from current_fomc_documents
             found_doc = next(
                 (d for d in documents if d.document_id == cite_dict.get('document_id')), None)
@@ -1069,18 +1484,18 @@ async def extract_themes(
 
         # Calculate confidence based on citation validity and quantity
         # Use LLM's confidence if provided
-        llm_confidence = theme_data.get("confidence", 0.7)
+        llm_confidence = theme_data.confidence
         citation_coverage_confidence = len(
-            validated_citations) / max(len(theme_data.get("citations", [])), 1)
+            validated_citations) / max(len(theme_data.citations), 1)
         final_confidence = (
             llm_confidence + citation_coverage_confidence) / 2  # Simple average
 
         try:
             themes.append(ThemeExtraction(
                 theme_id=f"theme_{uuid4().hex[:8]}",
-                theme_name=theme_data["theme_name"],
-                description=theme_data["description"],
-                keywords=theme_data.get("keywords", []),
+                theme_name=theme_data.theme_name,
+                description=theme_data.description,
+                keywords=theme_data.keywords,
                 citations=validated_citations,
                 # Ensure between 0 and 1
                 confidence=min(max(final_confidence, 0.0), 1.0)
@@ -1106,17 +1521,6 @@ async def extract_themes(
 #             f"Example Citation: '{theme.citations[0].quote}' from {theme.citations[0].document_id}")
 #     print("-" * 20)
 
-"""### 4.2. Quantifying Hawkish/Dovish Tone
-
-Alex needs a quantitative score for the Fed's tone, broken down into key economic components (inflation, employment, growth, policy bias, uncertainty). This multi-dimensional assessment, calibrated against prior meetings, offers a more objective measure than a subjective reading.
-
-The **Tone Score** ranges from -1.0 (extremely dovish) to +1.0 (extremely hawkish).
-
-$$ S_{{tone}} = \frac{{1}}{{N}} \sum_{{i=1}}^{{N}} w_i \cdot s_i $$
-
-Where $S_{{tone}}$ is the overall tone score, $N$ is the number of components, $w_i$ is the weighting of component $i$ (assumed equal for simplicity in LLM-based scoring), and $s_i$ is the sentiment score for component $i$.
-
-"""
 
 TONE_ANALYSIS_PROMPT = """
 You are an expert financial analyst tasked with assessing the hawkish/dovish tone of FOMC communications.
@@ -1164,6 +1568,7 @@ Documents to analyze:
 """
 
 
+# Pydantic models for structured output
 async def compute_tone_score(
     documents: List[FOMCDocument],
     prior_scores: Optional[List[ToneScore]] = None
@@ -1180,24 +1585,26 @@ async def compute_tone_score(
         for doc in documents
     ])
 
-    messages = [
-        {"role": "system", "content": TONE_ANALYSIS_PROMPT.format(
-            historical_context=historical_context,
-            combined_text=combined_text
-        )}
-    ]
+    prompt = TONE_ANALYSIS_PROMPT.format(
+        historical_context=historical_context,
+        combined_text=combined_text
+    )
 
-    response = await llm_client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=messages,
-        response_format={"type": "json_object"},
+    response = await llm_client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": prompt}
+        ],
+        response_format=ToneAnalysisResponse,
         temperature=0.3
     )
 
-    result = json.loads(response.choices[0].message.content)
+    result = response.choices[0].message.parsed
 
     validated_citations = []
-    for cite_dict in result.get("citations", []):
+    for cite in result.citations:
+        # Convert to dict for processing
+        cite_dict = cite.model_dump()
         # Need to get actual start/end positions from current_fomc_documents
         found_doc = next((d for d in documents if d.document_id ==
                          cite_dict.get('document_id')), None)
@@ -1227,11 +1634,11 @@ async def compute_tone_score(
 
     try:
         tone_score_obj = ToneScore(
-            score=result["overall_score"],
-            confidence=result["confidence"],
-            components=ToneComponents(**result["components"]),
+            score=result.overall_score,
+            confidence=result.confidence,
+            components=ToneComponents(**result.components.model_dump()),
             citations=validated_citations,
-            explanation=result["explanation"]
+            explanation=result.explanation
         )
     except ValidationError as e:
         logger.error("Failed to parse ToneScore from LLM output",
@@ -1273,7 +1680,7 @@ async def compute_tone_score(
 # # Execution: Compute tone score for the current FOMC documents
 # current_tone_score = await compute_tone_score(current_fomc_documents, mock_prior_tone_scores)
 
-print("\n--- Current Meeting Tone Analysis ---")
+# print("\n--- Current Meeting Tone Analysis ---")
 # print(
 #     f"Overall Tone Score: {current_tone_score.score:+.2f} (Confidence: {current_tone_score.confidence:.0%})")
 # print("Component Breakdown:")
@@ -1431,6 +1838,7 @@ Example:
 """
 
 
+# Pydantic models for structured output
 async def detect_surprises(
     current_documents: List[FOMCDocument],
     # List of dicts from search_historical_context
@@ -1452,27 +1860,29 @@ async def detect_surprises(
 
     prior_tone_explanation = f"Prior Meeting Tone ({prior_tone_analysis.citations[0].document_id.split('_')[2]}): Score {prior_tone_analysis.score:+.2f}. {prior_tone_analysis.explanation}"
 
-    messages = [
-        {"role": "system", "content": SURPRISE_DETECTION_PROMPT.format(
-            historical_context_summary=historical_context_summary,
-            current_documents_text=current_documents_text,
-            prior_tone_explanation=prior_tone_explanation
-        )}
-    ]
-
-    response = await llm_client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=0.4  # Slightly higher temperature for more exploratory analysis
+    prompt = SURPRISE_DETECTION_PROMPT.format(
+        historical_context_summary=historical_context_summary,
+        current_documents_text=current_documents_text,
+        prior_tone_explanation=prior_tone_explanation
     )
 
-    raw_surprises_output = json.loads(response.choices[0].message.content)
+    response = await llm_client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": prompt}
+        ],
+        response_format=SurprisesResponse,
+        temperature=0.4
+    )
+
+    raw_surprises_output = response.choices[0].message.parsed
 
     surprises = []
-    for surprise_data in raw_surprises_output.get("surprises", []):
+    for surprise_data in raw_surprises_output.surprises:
         validated_citations = []
-        for cite_dict in surprise_data.get("citations", []):
+        for cite in surprise_data.citations:
+            # Convert to dict for processing
+            cite_dict = cite.model_dump()
             # Need to get actual start/end positions from current_fomc_documents
             found_doc = next(
                 (d for d in current_documents if d.document_id == cite_dict.get('document_id')), None)
@@ -1501,17 +1911,17 @@ async def detect_surprises(
                     "LLM generated unverified citation in surprise detection", citation=cite_dict)
 
         # Use LLM's confidence if available, otherwise default to 0.7
-        llm_confidence = surprise_data.get("confidence", 0.7)
+        llm_confidence = surprise_data.confidence
         citation_coverage_confidence = len(
-            validated_citations) / max(len(surprise_data.get("citations", [])), 1)
+            validated_citations) / max(len(surprise_data.citations), 1)
         final_confidence = (llm_confidence + citation_coverage_confidence) / 2
 
         try:
             surprises.append(Surprise(
-                surprise_id=f"surprise_{uuid4().hex[:8]}",
-                category=surprise_data["category"],
-                description=surprise_data["description"],
-                market_relevance=surprise_data["market_relevance"],
+                surprise_id=surprise_data.surprise_id,
+                category=surprise_data.category,
+                description=surprise_data.description,
+                market_relevance=surprise_data.market_relevance,
                 citations=validated_citations,
                 confidence=min(max(final_confidence, 0.0), 1.0)
             ))
@@ -1596,40 +2006,33 @@ def validate_citation(citation: Citation, documents: List[FOMCDocument]) -> Vali
     return ValidationCheck(check_name="citation_validity", passed=True, details="Citation verified.", severity="info")
 
 
+# Pydantic model for hallucination check
 async def check_hallucination(claim: str, documents: List[FOMCDocument]) -> ValidationCheck:
     """
     Uses LLM to check if a claim is supported by source documents.
     """
     combined_text = "\n\n".join([doc.raw_text for doc in documents])
 
-    messages = [
-        {"role": "system", "content": """
-            You are a fact-checker. Determine if the given claim is supported by the source documents.
-            Respond with JSON:
-            {{
-              "supported": true/false,
-              "confidence": 0.0-1.0,
-              "supporting_evidence": "quote from source if supported",
-              "reason": "explanation of support or lack thereof"
-            }}
-        """},
-        {"role": "user", "content": f"""
-            CLAIM: {claim}
-            SOURCE DOCUMENTS:
-            {combined_text}
-        """}
-    ]
-    response = await llm_client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=messages,
-        response_format={"type": "json_object"},
-        temperature=0.0  # Deterministic for factual checks
+    response = await llm_client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": """
+                You are a fact-checker. Determine if the given claim is supported by the source documents.
+            """},
+            {"role": "user", "content": f"""
+                CLAIM: {claim}
+                SOURCE DOCUMENTS:
+                {combined_text}
+            """}
+        ],
+        response_format=HallucinationCheckResponse,
+        temperature=0.0
     )
-    result = json.loads(response.choices[0].message.content)
+    result = response.choices[0].message.parsed
 
-    is_supported = result.get("supported", False)
-    confidence = result.get("confidence", 0.0)
-    reason = result.get("reason", "No reason provided.")
+    is_supported = result.supported
+    confidence = result.confidence
+    reason = result.reason
 
     if not is_supported:
         return ValidationCheck(check_name="hallucination_detection", passed=False,
@@ -2009,30 +2412,31 @@ async def generate_fomc_memo(
         [f"{c.check_name}: {'Passed' if c.passed else 'Failed'}" for c in validation_report.checks])
 
     # Generate executive summary and market implications using LLM
-    llm_generation_messages = [
-        {"role": "system", "content": MEMO_GENERATION_PROMPT.format(
-            meeting_date=meeting_date.isoformat(),
-            themes_summary=themes_summary,
-            tone_score=tone_analysis.score,
-            tone_confidence=tone_analysis.confidence,
-            tone_explanation=tone_analysis.explanation,
-            delta_summary=delta_summary,
-            surprises_summary=surprises_summary,
-            historical_context_summary=historical_context_summary,
-            validation_passed=validation_report.all_checks_passed,
-            validation_details=validation_details
-        )}
-    ]
-    llm_response = await llm_client.chat.completions.create(
-        model="gpt-4-turbo",
-        messages=llm_generation_messages,
-        response_format={"type": "json_object"},
+    prompt = MEMO_GENERATION_PROMPT.format(
+        meeting_date=meeting_date.isoformat(),
+        themes_summary=themes_summary,
+        tone_score=tone_analysis.score,
+        tone_confidence=tone_analysis.confidence,
+        tone_explanation=tone_analysis.explanation,
+        delta_summary=delta_summary,
+        surprises_summary=surprises_summary,
+        historical_context_summary=historical_context_summary,
+        validation_passed=validation_report.all_checks_passed,
+        validation_details=validation_details
+    )
+
+    llm_response = await llm_client.beta.chat.completions.parse(
+        model="gpt-4o-2024-08-06",
+        messages=[
+            {"role": "system", "content": prompt}
+        ],
+        response_format=MemoGenerationResponse,
         temperature=0.4
     )
-    llm_generated_content = json.loads(llm_response.choices[0].message.content)
+    llm_generated_content = llm_response.choices[0].message.parsed
 
-    executive_summary = llm_generated_content["executive_summary"]
-    market_implications = llm_generated_content["market_implications"]
+    executive_summary = llm_generated_content.executive_summary
+    market_implications = llm_generated_content.market_implications
     if market_implications_input:  # Override if manual input is provided
         market_implications = market_implications_input
 
@@ -2273,14 +2677,26 @@ def get_fomc_meeting_dates(start: date, end: date) -> List[date]:
     # FOMC typically meets 8 times per year
     # These are approximate mock dates for demonstration
     mock_dates = [
-        date(2024, 1, 31),
-        date(2024, 3, 20),
-        date(2024, 5, 1),
-        date(2024, 6, 12),
-        date(2024, 7, 31),
-        date(2024, 9, 18),
-        date(2024, 11, 7),
+        date(2025, 12, 10),
+        date(2025, 10, 29),
+        date(2025, 9, 17),
+        date(2025, 7, 30),
+        date(2025, 6, 18),
+        date(2025, 5, 7),
+        date(2025, 3, 19),
+        date(2025, 1, 29),
+
+        # 2024
         date(2024, 12, 18),
+        date(2024, 11, 7),
+        date(2024, 9, 18),
+        date(2024, 7, 31),
+        date(2024, 6, 12),
+        date(2024, 5, 1),
+        date(2024, 3, 20),
+        date(2024, 1, 31),
+
+        # 2023
         date(2023, 12, 13),
         date(2023, 11, 1),
         date(2023, 9, 20),
@@ -2289,6 +2705,27 @@ def get_fomc_meeting_dates(start: date, end: date) -> List[date]:
         date(2023, 5, 3),
         date(2023, 3, 22),
         date(2023, 2, 1),
+
+        # 2022
+        date(2022, 12, 14),
+        date(2022, 11, 2),
+        date(2022, 9, 21),
+        date(2022, 7, 27),
+        date(2022, 6, 15),
+        date(2022, 5, 4),
+        date(2022, 3, 16),
+        date(2022, 1, 26),
+
+        # 2021
+        date(2021, 12, 15),
+        date(2021, 11, 3),
+        date(2021, 9, 22),
+        date(2021, 7, 28),
+        date(2021, 6, 16),
+        date(2021, 4, 28),
+        date(2021, 3, 17),
+        date(2021, 1, 27),
+
     ]
 
     # Filter dates within range
