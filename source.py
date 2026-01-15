@@ -91,7 +91,7 @@ structlog.configure(
 logger = structlog.get_logger()
 
 # Global LLM client (Changed to AsyncOpenAI for async calls)
-llm_client = openai.AsyncOpenAI()
+llm_client = None
 
 """### 1.3. Define Pydantic Data Models and Utility Functions
 
@@ -301,6 +301,7 @@ def construct_fed_url(meeting_date: date, doc_type: str) -> str:
     document types and release schedules.
     """
     date_str = meeting_date.strftime("%Y%m%d")
+    print(date_str)
     if doc_type == "statement":
         return f"https://www.federalreserve.gov/newsevents/pressreleases/monetary{date_str}a.htm"
     elif doc_type == "minutes":
@@ -310,7 +311,7 @@ def construct_fed_url(meeting_date: date, doc_type: str) -> str:
         return f"https://www.federalreserve.gov/monetarypolicy/fomcminutes{release_date_str}.htm"
     elif doc_type == "press_conference":
         # Mock for presser
-        return f"https://www.federalreserve.gov/newsevents/pressreleases/monetary{date_str}b.htm"
+        return f"https://www.federalreserve.gov/mediacenter/files/FOMCpresconf{date_str}.pdf"
     return "mock_url_not_found"
 
 
