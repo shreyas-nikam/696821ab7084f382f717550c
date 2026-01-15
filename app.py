@@ -21,36 +21,6 @@ st.divider()
 
 # CSS Styles
 st.markdown("""
-<style>
-.main-header {
-    color: #00d4ff; /* Accent color */
-    font-size: 2.5rem;
-    font-weight: bold;
-}
-.status-pending {
-    background-color: #ffa500; /* Orange */
-    color: black;
-    padding: 4px 12px;
-    border-radius: 4px;
-}
-.status-approved {
-    background-color: #4ade80; /* Green */
-    color: black;
-    padding: 4px 12px;
-    border-radius: 4px;
-}
-.citation-card {
-    background-color: #1a1f2e;
-    border: 1px solid #2a3654;
-    border-radius: 8px;
-    padding: 16px;
-    margin: 8px 0;
-}
-.stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
-    font-size: 1.1em;
-    font-weight: bold;
-}
-</style>
 """, unsafe_allow_html=True)
 
 # Session State Initialization
