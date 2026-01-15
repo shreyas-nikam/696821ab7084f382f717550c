@@ -22,9 +22,6 @@ st.divider()
 # CSS Styles
 st.markdown("""
 <style>
-.stApp {
-    background-color: #0a0f1a; /* Dark background */
-}
 .main-header {
     color: #00d4ff; /* Accent color */
     font-size: 2.5rem;
