@@ -798,6 +798,7 @@ def get_cache_path(doc_type: str, meeting_date: date) -> Path:
     date_str = meeting_date.strftime("%Y%m%d")
     return CACHE_DIR / f"{doc_type}_{date_str}.html"
 
+
 def load_from_cache(doc_type: str, meeting_date: date) -> Optional[str]:
     """Load HTML content from cache if it exists."""
     cache_path = get_cache_path(doc_type, meeting_date)
@@ -809,6 +810,7 @@ def load_from_cache(doc_type: str, meeting_date: date) -> Optional[str]:
             return None
     return None
 
+
 def save_to_cache(doc_type: str, meeting_date: date, html_content: str) -> None:
     """Save HTML content to cache."""
     cache_path = get_cache_path(doc_type, meeting_date)
@@ -818,6 +820,7 @@ def save_to_cache(doc_type: str, meeting_date: date, html_content: str) -> None:
     except Exception as e:
         print(f"Error saving to cache {cache_path}: {e}")
 
+
 async def fetch_fomc_statement_from_url(url: str, meeting_date: date) -> Optional[FOMCDocument]:
     """
     Fetches and parses an FOMC statement from the provided URL.
@@ -826,7 +829,7 @@ async def fetch_fomc_statement_from_url(url: str, meeting_date: date) -> Optiona
     try:
         # Check cache first
         html_content = load_from_cache("statement", meeting_date)
-        
+
         if html_content is None:
             # Fetch from URL if not in cache
             async with httpx.AsyncClient(timeout=30.0) as client:
@@ -907,7 +910,7 @@ async def fetch_fomc_minutes_from_url(url: str, meeting_date: date) -> Optional[
     try:
         # Check cache first
         html_content = load_from_cache("minutes", meeting_date)
-        
+
         if html_content is None:
             # Fetch from URL if not in cache
             async with httpx.AsyncClient(timeout=30.0) as client:

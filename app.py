@@ -287,11 +287,8 @@ def render_new_analysis():
 
         async def run_analysis_workflow():
             try:
-                st.write("🔍 Step 1: Creating workflow...")
                 workflow = create_fomc_workflow()
-                st.write("✅ Workflow created successfully")
 
-                st.write("🔍 Step 2: Creating initial state...")
                 initial_state = AgentState(
                     meeting_date=selected_meeting,
                     request_id=request_id,
@@ -303,14 +300,12 @@ def render_new_analysis():
                         "minimum_confidence_threshold": minimum_confidence_threshold,
                     }
                 )
-                st.write(f"✅ Initial state created: {initial_state}")
 
                 step_count = 0
                 total_steps = 10
                 final_state = None
                 logged_nodes = set()  # Track which nodes we've already logged
 
-                st.write("🔍 Step 3: Starting workflow stream...")
                 try:
                     # Use astream_events for more granular control and status updates
                     async for event in workflow.astream_events(initial_state, {"configurable": {"thread_id": request_id}}, version="v1"):
@@ -345,9 +340,6 @@ def render_new_analysis():
                             with log_container:
                                 st.markdown(f"✓ Started: `{current_node}`")
 
-                            st.write(
-                                f"📊 Processing node: {current_node}, Progress: {progress:.2%}")
-
                             # Store detailed events in session_manager
                             try:
                                 session_manager.update_step(
@@ -358,12 +350,8 @@ def render_new_analysis():
 
                         # Assuming 'workflow' is the top-level chain name
                         if event_type == "on_chain_end" and event["name"] == "workflow":
-                            st.write(
-                                "🔍 Step 4: Workflow chain ended, extracting final state...")
                             # Extract final state from workflow output
                             final_state = event["data"]["output"]["output"]
-                            st.write(
-                                f"✅ Final state extracted: {type(final_state)}")
 
                     st.write("✅ Workflow stream completed")
                 except Exception as stream_error:
@@ -376,7 +364,6 @@ def render_new_analysis():
                 progress_bar.progress(1.0, text="Analysis Complete!")
                 status_text.success("Workflow finished successfully!")
 
-                st.write("🔍 Step 5: Processing final state...")
                 # Update request history and latest memo data
                 if final_state and final_state.get("draft_memo"):
                     st.write("✅ Draft memo found in final state")
